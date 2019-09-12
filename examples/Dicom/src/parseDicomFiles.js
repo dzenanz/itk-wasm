@@ -5,6 +5,18 @@ import "regenerator-runtime/runtime";
 
 import DICOM_TAG_DICT from './dicomTags'
 
+function concatenate(resultConstructor, arrays) {
+  const totalLength = arrays.reduce((total, arr) => {
+    return total + arr.length
+  }, 0);
+  const result = new resultConstructor(totalLength);
+  arrays.reduce((offset, arr) => {
+    result.set(arr, offset);
+    return offset + arr.length;
+  }, 0);
+  return result;
+}
+
 class DICOMEntity {
   constructor() {
     this.metaData = {}
@@ -120,6 +132,114 @@ class DICOMSeries extends DICOMEntity {
     }
     this.images[imageNumber] = new DICOMImage(metaData, file)
   }
+
+  getImageData() {
+    function numArrayFromString(str, separator = '\\') {
+      const strArray = str.split(separator)
+      return strArray.map(Number)
+    }
+
+    const slices = Object.values(this.images)
+    const meta = slices[0].metaData
+
+    // Origin
+    const origin = numArrayFromString(meta.ImagePositionPatient)
+
+    // Spacing
+    const spacing = numArrayFromString(meta.PixelSpacing)
+    spacing.push(Number(meta.SliceThickness)) // TODO: or SpacingBetweenSlices?
+
+    // Dimensions
+    const size = [
+      meta.Rows,
+      meta.Columns,
+      Object.keys(this.images).length,
+    ]
+
+    // Direction matrix (3x3)
+    const directionCosines = numArrayFromString(meta.ImageOrientationPatient)
+    const iDirCos = directionCosines.slice(0, 3)
+    const jDirCos = directionCosines.slice(3, 6)
+    const kDirCos = [
+      iDirCos[1] * jDirCos[2] - iDirCos[2] * jDirCos[1],
+      iDirCos[2] * jDirCos[0] - iDirCos[0] * jDirCos[2],
+      iDirCos[0] * jDirCos[1] - iDirCos[1] * jDirCos[0],
+    ]
+    const direction = {
+      data: [
+        iDirCos[0], jDirCos[0], kDirCos[0],
+        iDirCos[1], jDirCos[1], kDirCos[1],
+        iDirCos[2], jDirCos[2], kDirCos[2],
+      ],
+    }
+
+    // Pixel data type
+    const unsigned = (meta.PixelRepresentation === 0) && (meta.RescaleIntercept > 0)
+    const bits = meta.BitsAllocated
+    let ArrayType
+    let intType
+    switch (bits) {
+      case 8:
+        ArrayType = unsigned ? Uint8Array : Int8Array
+        intType = unsigned ? 'uint8_t' : 'int8_t'
+        break
+      case 16:
+        ArrayType = unsigned ? Uint16Array : Int16Array
+        intType = unsigned ? 'uint16_t' : 'int16_t'
+        break
+      case 32:
+        ArrayType = unsigned ? Uint32Array : Int32Array
+        intType = unsigned ? 'uint32_t' : 'int32_t'
+        break
+      default:
+        throw Error(`Unknown pixel bit type (${bits})`)
+    }
+
+    // Image info
+    const imageType = {
+      dimension: 3,
+      componentType: intType,
+      pixelType: 1, // TODO: based on meta.PhotometricInterpretation?
+      components: meta.SamplesPerPixel,
+    }
+
+    // Dataview on pixel data
+    const pixelDataArrays = slices.map((image) => {
+      const value = image.metaData.PixelData
+      if (value.buffer.constructor === ArrayType && value.offset === 0) {
+        return value.buffer
+      }
+      return new ArrayType(value.buffer, value.offset)
+    })
+
+    // Concatenate all pixel data
+    const data = pixelDataArrays.length === 1
+      ? pixelDataArrays[0]
+      : concatenate(ArrayType, pixelDataArrays)
+
+    // Rescale
+    const b = Number(meta.RescaleIntercept)
+    const m = Number(meta.RescaleSlope)
+    const hasIntercept = !Number.isNaN(b) && b !== 0
+    const hasSlope = !Number.isNaN(m) && m !== 1
+    let rescaleFunction
+    if (hasIntercept && hasSlope) {
+      data = data.map((value) => m * value + b)
+    } else if (hasIntercept) {
+      data = data.map((value) => value + b)
+    } else if (hasSlope) {
+      data = data.map((value) => m * value)
+    }
+
+    return {
+      imageType,
+      origin,
+      spacing,
+      direction,
+      size,
+      data,
+    }
+  }
 }
 
 class DICOMImage extends DICOMEntity {
@@ -147,6 +267,9 @@ class DICOMImage extends DICOMEntity {
       'BitsStored',
       'HighBit',
       'PixelRepresentation',
+      'PixelData',
+      'RescaleIntercept',
+      'RescaleSlope',
       ]
     }
 
@@ -223,60 +346,86 @@ async function parseDicomFiles(fileList, ignoreFailedFiles = false) {
           return
         }
 
-        if (element.fragments) {
-          console.warn(`${tagName} contains fragments which isn't supported`)
-          return
-        }
-
-        let vr = element.vr
-        if (vr === undefined) {
-          if (tagInfo === undefined || tagInfo.vr === undefined) {
-            console.warn(`${tagName} vr is unknown, skipping`)
-          }
-          vr = tagInfo.vr
-        }
-
         let value = undefined
-        switch (vr) {
-          case 'US':
-            value = dataSet.uint16(tag)
-            break
-          case 'SS':
-            value = dataSet.int16(tag)
-            break
-          case 'UL':
-            value = dataSet.uint32(tag)
-            break
-          case 'US':
-            value = dataSet.int32(tag)
-            break
-          case 'FD':
-            value = dataSet.double(tag)
-            break
-          case 'FL':
-            value = dataSet.float(tag)
-            break
-          case 'AT':
-            value = `(${dataSet.uint16(tag, 0)},${dataSet.uint16(tag, 1)})`
-            break
-          case 'OB':
-          case 'OW':
-          case 'UN':
-          case 'OF':
-          case 'UT':
-            // TODO: binary data? is this correct?
-            if (element.length === 2) {
-              value = dataSet.uint16(tag)
-            } else if (element.length === 4) {
-              value = dataSet.uint32(tag)
-            } else {
-              // don't store binary data, only meta data
-              return
+
+        if (tagName === 'PixelData') {
+          if (element.fragments) {
+            let bot = element.basicOffsetTable
+            // if basic offset table is empty, calculate it
+            if (bot.length === 0) {
+              bot = dicomParser.createJPEGBasicOffsetTable(dataSet, element)
             }
-            break
-          default: //string
-            value = dataSet.string(tag)
-            break
+
+            const imageFrames = []
+            for (let frameIndex = 0; frameIndex < bot.length; frameIndex += 1) {
+              imageFrames.push(dicomParser.readEncapsulatedImageFrame(dataSet, element, 0, bot))
+            }
+            const buffer = imageFrames.length === 1
+              ? imageFrames[0]
+              : concatenate(imageFrames[0].constructor, imageFrames)
+            value = {
+              buffer,
+              offset: 0,
+              length: buffer.length,
+              encapsulated: true,
+            }
+          } else {
+            value = {
+              buffer: dataSet.byteArray.buffer,
+              offset: element.dataOffset,
+              length: element.length,
+              encapsulated: false,
+            }
+          }
+        } else {
+          let vr = element.vr
+          if (vr === undefined) {
+            if (tagInfo === undefined || tagInfo.vr === undefined) {
+              console.warn(`${tagName} vr is unknown, skipping`)
+            }
+            vr = tagInfo.vr
+          }
+
+          switch (vr) {
+            case 'US':
+              value = dataSet.uint16(tag)
+              break
+            case 'SS':
+              value = dataSet.int16(tag)
+              break
+            case 'UL':
+              value = dataSet.uint32(tag)
+              break
+            case 'US':
+              value = dataSet.int32(tag)
+              break
+            case 'FD':
+              value = dataSet.double(tag)
+              break
+            case 'FL':
+              value = dataSet.float(tag)
+              break
+            case 'AT':
+              value = `(${dataSet.uint16(tag, 0)},${dataSet.uint16(tag, 1)})`
+              break
+            case 'OB':
+            case 'OW':
+            case 'UN':
+            case 'OF':
+            case 'UT':
+              // TODO: binary data? is this correct?
+              if (element.length === 2) {
+                value = dataSet.uint16(tag)
+              } else if (element.length === 4) {
+                value = dataSet.uint32(tag)
+              } else {
+                return
+              }
+              break
+            default: //string
+              value = dataSet.string(tag)
+              break
+          }
         }
 
         metaData[tagName] = value
