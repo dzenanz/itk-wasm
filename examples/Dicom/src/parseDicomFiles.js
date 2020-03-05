@@ -151,8 +151,8 @@ class DICOMSeries extends DICOMEntity {
 
     // Dimensions
     const size = [
-      meta.Rows,
       meta.Columns,
+      meta.Rows,
       Object.keys(this.images).length,
     ]
 
@@ -454,6 +454,10 @@ async function parseDicomFiles(fileList, ignoreFailedFiles = false) {
   const logName = `Parsed ${fileList.length} DICOM files in`
   console.time(logName)
   await Promise.all(parseFiles).then(() => {
+    console.log(patients)
+    if (failures.length > 0) {
+      console.error(failures[0].error.stack)
+    }
     if (!ignoreFailedFiles && failures.length > 0) {
       throw new ParseDicomError(failures)
     }
